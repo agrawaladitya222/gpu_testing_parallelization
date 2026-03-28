@@ -23,14 +23,6 @@ if errorlevel 1 (
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
 
 echo.
-echo Installing PyTorch (CUDA 11.8 wheels^)...
-"%VENV_PY%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-if errorlevel 1 (
-    echo PyTorch install failed.
-    exit /b 1
-)
-
-echo.
 echo Installing NumPy ^(^<2^)...
 "%VENV_PY%" -m pip install "numpy<2"
 if errorlevel 1 (
@@ -45,6 +37,16 @@ if errorlevel 1 (
     echo scikit-learn install failed.
     exit /b 1
 )
+
+echo.
+echo Installing PyTorch (CUDA 11.8 wheels^)...
+"%VENV_PY%" -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+if errorlevel 1 (
+    echo PyTorch install failed.
+    exit /b 1
+)
+
+
 
 echo.
 echo Done. Dependencies are installed in .venv. Activate to use them:
