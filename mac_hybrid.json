@@ -1,0 +1,20 @@
+{
+  "machine": "Adityas-MacBook-Pro.local",
+  "system": "macOS-26.3.1-arm64-arm-64bit",
+  "mode": "hybrid",
+  "accel_device": "mps",
+  "cpu_threads": 6,
+  "data_build_time_sec": 0.4246024580061203,
+  "data_repeats": 300,
+  "batch_size": 1536,
+  "epochs": 8,
+  "mm_size": 512,
+  "mm_repeats": 1,
+  "cpu_preprocess_loops": 3,
+  "eval_cpu_preprocess_loops": 2,
+  "total_steps": 2248,
+  "total_time_sec": 51.13940395800455,
+  "steps_per_sec": 43.95827534177065,
+  "final_test_loss": 1.0394928213252448,
+  "final_test_acc": 0.9725468373214617
+}

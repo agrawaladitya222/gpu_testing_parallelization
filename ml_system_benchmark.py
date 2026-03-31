@@ -1,4 +1,3 @@
-import os
 import time
 import json
 import math
@@ -15,25 +14,26 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
 
-# =========================
-# Defaults
-# =========================
+# =========================================================
+# Defaults chosen to avoid huge RAM/swap pressure
+# while still creating a meaningful ML-style benchmark
+# =========================================================
 DEFAULTS = {
     "seed": 42,
-    "data_repeats": 2500,          # much larger workload than before
-    "batch_size": 2048,
-    "epochs": 12,
+    "data_repeats": 300,             # much smaller than before
+    "batch_size": 1024,
+    "epochs": 8,
     "learning_rate": 0.0015,
     "hidden_1": 1024,
-    "hidden_2": 1024,
+    "hidden_2": 512,
     "dropout": 0.10,
-    "num_workers": 0,              # use 0 on mac first for simplicity/stability
-    "mm_size": 768,
+    "num_workers": 0,                # keep 0 initially for stability
+    "mm_size": 512,
     "mm_repeats_per_batch": 1,
     "report_every": 25,
     "test_size": 0.2,
-    "feature_expand_factor": 4,    # CPU-side engineered features
-    "cpu_preprocess_loops": 2,     # increase for more CPU load
+    "cpu_preprocess_loops": 3,
+    "eval_cpu_preprocess_loops": 2,
 }
 
 
@@ -74,45 +74,65 @@ def current_memory_mb(device: torch.device | None):
     return None
 
 
-def build_large_tabular_dataset(data_repeats: int, feature_expand_factor: int, seed: int):
+def build_base_dataset(data_repeats: int, seed: int):
+    """
+    Keeps the global dataset relatively compact.
+    Heavy work is moved to per-batch transforms instead.
+    """
     digits = load_digits()
     X = digits.data.astype(np.float32) / 16.0
     y = digits.target.astype(np.int64)
 
-    # repeat real data to create a much larger benchmark
-    X = np.tile(X, (data_repeats, 1))
-    y = np.tile(y, data_repeats)
-
-    rng = np.random.default_rng(seed)
-
-    # engineered CPU-heavy features
-    feature_blocks = [X]
-    for i in range(feature_expand_factor):
-        noise = rng.normal(0, 0.03, size=X.shape).astype(np.float32)
-        block = X + noise
-
-        # nonlinear expansion
-        if i % 2 == 0:
-            block = np.square(block)
-        else:
-            block = np.sqrt(np.abs(block) + 1e-6)
-
-        feature_blocks.append(block.astype(np.float32))
-
-    X = np.concatenate(feature_blocks, axis=1).astype(np.float32)
-
-    # add interaction-style compressed features
-    proj = rng.normal(0, 1, size=(X.shape[1], min(256, X.shape[1]))).astype(np.float32)
-    X_proj = X @ proj
-    X = np.concatenate([X, X_proj], axis=1).astype(np.float32)
+    X = np.tile(X, (data_repeats, 1)).astype(np.float32)
+    y = np.tile(y, data_repeats).astype(np.int64)
 
     scaler = StandardScaler()
     X = scaler.fit_transform(X).astype(np.float32)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=DEFAULTS["test_size"], random_state=seed, stratify=y
+        X,
+        y,
+        test_size=DEFAULTS["test_size"],
+        random_state=seed,
+        stratify=y,
     )
+
     return X_train, X_test, y_train, y_test
+
+
+def cpu_feature_stress(x_cpu: torch.Tensor, loops: int) -> torch.Tensor:
+    """
+    Compute-heavy but memory-safer preprocessing.
+    Keeps shape fixed instead of repeatedly concatenating tensors.
+    This is much better for CPU benchmarking than unbounded tensor growth.
+    """
+    out = x_cpu
+
+    for _ in range(loops):
+        a = torch.sin(out)
+        b = torch.cos(out)
+        c = torch.tanh(out)
+        d = torch.square(out)
+        e = torch.sqrt(torch.abs(out) + 1e-6)
+
+        out = (
+            0.30 * out
+            + 0.20 * a
+            + 0.15 * b
+            + 0.15 * c
+            + 0.10 * d
+            + 0.10 * e
+        )
+
+        # small dense mixing to simulate feature interactions
+        half = max(1, out.shape[1] // 2)
+        left = out[:, :half]
+        right = out[:, -half:]
+        mixed = left * right
+        mixed_mean = mixed.mean(dim=1, keepdim=True)
+        out = out + mixed_mean
+
+    return out
 
 
 class TabularMLP(nn.Module):
@@ -125,35 +145,17 @@ class TabularMLP(nn.Module):
             nn.Linear(hidden_1, hidden_2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_2, 512),
+            nn.Linear(hidden_2, 256),
             nn.ReLU(),
-            nn.Linear(512, num_classes),
+            nn.Linear(256, num_classes),
         )
 
     def forward(self, x):
         return self.net(x)
 
 
-def cpu_feature_stress(x_cpu: torch.Tensor, loops: int) -> torch.Tensor:
-    """
-    CPU-heavy batch feature engineering to simulate realistic preprocessing.
-    """
-    out = x_cpu
-    for _ in range(loops):
-        a = torch.sin(out)
-        b = torch.cos(out)
-        c = a * b
-        d = torch.square(out)
-        out = torch.cat([out, c, d], dim=1)
-
-        # keep dimensions bounded
-        if out.shape[1] > 2048:
-            out = out[:, :2048]
-    return out
-
-
 @torch.no_grad()
-def evaluate(model, loader, compute_device, mode, cpu_preprocess_loops, loss_fn):
+def evaluate(model, loader, compute_device, mode, eval_cpu_preprocess_loops, loss_fn):
     model.eval()
     total_loss = 0.0
     total_correct = 0
@@ -161,20 +163,23 @@ def evaluate(model, loader, compute_device, mode, cpu_preprocess_loops, loss_fn)
 
     for xb, yb in loader:
         if mode == "cpu":
-            xb_proc = cpu_feature_stress(xb, cpu_preprocess_loops)
+            xb_proc = cpu_feature_stress(xb, eval_cpu_preprocess_loops)
             logits = model(xb_proc)
             loss = loss_fn(logits, yb)
+
         elif mode == "accel":
             xb = xb.to(compute_device)
             yb = yb.to(compute_device)
             logits = model(xb)
             loss = loss_fn(logits, yb)
+
         elif mode == "hybrid":
-            xb_proc = cpu_feature_stress(xb, cpu_preprocess_loops)
+            xb_proc = cpu_feature_stress(xb, eval_cpu_preprocess_loops)
             xb_proc = xb_proc.to(compute_device)
             yb = yb.to(compute_device)
             logits = model(xb_proc)
             loss = loss_fn(logits, yb)
+
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -196,7 +201,8 @@ def main():
     parser.add_argument("--mm-size", type=int, default=DEFAULTS["mm_size"])
     parser.add_argument("--mm-repeats", type=int, default=DEFAULTS["mm_repeats_per_batch"])
     parser.add_argument("--cpu-preprocess-loops", type=int, default=DEFAULTS["cpu_preprocess_loops"])
-    parser.add_argument("--threads", type=int, default=None, help="CPU threads for cpu mode")
+    parser.add_argument("--eval-cpu-preprocess-loops", type=int, default=DEFAULTS["eval_cpu_preprocess_loops"])
+    parser.add_argument("--threads", type=int, default=None)
     parser.add_argument("--output", type=str, default=None)
     args = parser.parse_args()
 
@@ -209,52 +215,48 @@ def main():
     system_name = platform.system().lower()
 
     if args.mode in {"accel", "hybrid"} and accel_device is None:
-        raise RuntimeError("No accelerator found (CUDA/MPS unavailable).")
+        raise RuntimeError("No accelerator found. CUDA/MPS unavailable.")
 
     print("=" * 80)
-    print("ML SYSTEM BENCHMARK")
+    print("ML SYSTEM BENCHMARK V2")
     print("=" * 80)
-    print(f"System: {platform.platform()}")
-    print(f"Mode: {args.mode}")
-    print(f"CPU threads: {torch.get_num_threads()}")
-    print(f"Accelerator: {accel_device}")
+    print(f"System:       {platform.platform()}")
+    print(f"Mode:         {args.mode}")
+    print(f"CPU threads:  {torch.get_num_threads()}")
+    print(f"Accelerator:  {accel_device}")
     print()
 
-    # -------------------------
+    # -----------------------------------------------------
     # Data build phase
-    # -------------------------
-    t0 = time.perf_counter()
-    X_train, X_test, y_train, y_test = build_large_tabular_dataset(
+    # -----------------------------------------------------
+    data_start = time.perf_counter()
+    X_train, X_test, y_train, y_test = build_base_dataset(
         data_repeats=args.data_repeats,
-        feature_expand_factor=DEFAULTS["feature_expand_factor"],
         seed=DEFAULTS["seed"],
     )
-    data_build_time = time.perf_counter() - t0
+    data_build_time = time.perf_counter() - data_start
 
-    # For cpu mode we pre-expand features inside training loop too.
-    # For accel mode we keep dataset as-is to stress accelerator more.
-    # For hybrid mode we preprocess on CPU per batch, then move to device.
-    if args.mode == "cpu":
-        sample_in = cpu_feature_stress(torch.tensor(X_train[:64]), args.cpu_preprocess_loops)
-        input_dim = sample_in.shape[1]
-    elif args.mode == "accel":
-        input_dim = X_train.shape[1]
-    else:  # hybrid
-        sample_in = cpu_feature_stress(torch.tensor(X_train[:64]), args.cpu_preprocess_loops)
-        input_dim = sample_in.shape[1]
-
+    # Input dim stays fixed now
+    input_dim = X_train.shape[1]
     num_classes = len(np.unique(y_train))
 
     train_loader = DataLoader(
-        TensorDataset(torch.tensor(X_train, dtype=torch.float32), torch.tensor(y_train, dtype=torch.long)),
+        TensorDataset(
+            torch.tensor(X_train, dtype=torch.float32),
+            torch.tensor(y_train, dtype=torch.long),
+        ),
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=DEFAULTS["num_workers"],
         pin_memory=(system_name == "windows"),
         drop_last=False,
     )
+
     test_loader = DataLoader(
-        TensorDataset(torch.tensor(X_test, dtype=torch.float32), torch.tensor(y_test, dtype=torch.long)),
+        TensorDataset(
+            torch.tensor(X_test, dtype=torch.float32),
+            torch.tensor(y_test, dtype=torch.long),
+        ),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=DEFAULTS["num_workers"],
@@ -271,20 +273,20 @@ def main():
         hidden_2=DEFAULTS["hidden_2"],
         dropout=DEFAULTS["dropout"],
     )
+
     if compute_device is not None:
         model = model.to(compute_device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=DEFAULTS["learning_rate"])
     loss_fn = nn.CrossEntropyLoss()
 
-    # extra tensor-kernel stress
-    A = B = None
-    if args.mode in {"accel", "hybrid"}:
-        A = torch.randn((args.mm_size, args.mm_size), device=compute_device)
-        B = torch.randn((args.mm_size, args.mm_size), device=compute_device)
-    elif args.mode == "cpu":
+    # Extra math-kernel stress
+    if args.mode == "cpu":
         A = torch.randn((args.mm_size, args.mm_size))
         B = torch.randn((args.mm_size, args.mm_size))
+    else:
+        A = torch.randn((args.mm_size, args.mm_size), device=compute_device)
+        B = torch.randn((args.mm_size, args.mm_size), device=compute_device)
 
     sync_device(compute_device)
     overall_start = time.perf_counter()
@@ -312,6 +314,8 @@ def main():
                     A = torch.relu(C)
                     B = torch.relu(torch.mm(B, A))
 
+                compare_target = yb_proc
+
             elif args.mode == "accel":
                 xb = xb.to(compute_device)
                 yb = yb.to(compute_device)
@@ -326,6 +330,8 @@ def main():
                     C = torch.mm(A, B)
                     A = torch.relu(C)
                     B = torch.relu(torch.mm(B, A))
+
+                compare_target = yb
 
             elif args.mode == "hybrid":
                 xb_proc = cpu_feature_stress(xb, args.cpu_preprocess_loops)
@@ -343,6 +349,11 @@ def main():
                     A = torch.relu(C)
                     B = torch.relu(torch.mm(B, A))
 
+                compare_target = yb
+
+            else:
+                raise ValueError(f"Unknown mode: {args.mode}")
+
             running_loss += loss.item() * xb.size(0)
             seen += xb.size(0)
             total_steps += 1
@@ -350,33 +361,35 @@ def main():
             if batch_idx % args.report_every == 0 or batch_idx == len(train_loader):
                 sync_device(compute_device)
                 elapsed = time.perf_counter() - overall_start
-                sps = total_steps / elapsed if elapsed > 0 else float("nan")
+                steps_per_sec = total_steps / elapsed if elapsed > 0 else float("nan")
                 mem = current_memory_mb(compute_device)
+                mem_str = f"{mem:.1f} MB" if mem is not None else "N/A"
 
                 with torch.no_grad():
-                    acc = (logits.argmax(dim=1) == (yb if args.mode != "cpu" else yb_proc)).float().mean().item()
+                    batch_acc = (logits.argmax(dim=1) == compare_target).float().mean().item()
 
-                mem_str = f"{mem:.1f} MB" if mem is not None else "N/A"
                 print(
                     f"Epoch {epoch:02d}/{args.epochs} | "
                     f"Batch {batch_idx:04d}/{len(train_loader)} | "
                     f"Loss {loss.item():.4f} | "
-                    f"Batch Acc {acc:.4f} | "
-                    f"Steps/s {sps:.2f} | "
+                    f"Batch Acc {batch_acc:.4f} | "
+                    f"Steps/s {steps_per_sec:.2f} | "
                     f"Mem {mem_str}"
                 )
 
         sync_device(compute_device)
         epoch_time = time.perf_counter() - epoch_start
-        train_loss = running_loss / seen
+
         test_loss, test_acc = evaluate(
             model=model,
             loader=test_loader,
             compute_device=compute_device,
             mode=args.mode,
-            cpu_preprocess_loops=args.cpu_preprocess_loops,
+            eval_cpu_preprocess_loops=args.eval_cpu_preprocess_loops,
             loss_fn=loss_fn,
         )
+
+        train_loss = running_loss / seen
 
         print(
             f"[Epoch Summary] Epoch {epoch:02d} | "
@@ -395,7 +408,7 @@ def main():
         loader=test_loader,
         compute_device=compute_device,
         mode=args.mode,
-        cpu_preprocess_loops=args.cpu_preprocess_loops,
+        eval_cpu_preprocess_loops=args.eval_cpu_preprocess_loops,
         loss_fn=loss_fn,
     )
 
@@ -412,6 +425,7 @@ def main():
         "mm_size": args.mm_size,
         "mm_repeats": args.mm_repeats,
         "cpu_preprocess_loops": args.cpu_preprocess_loops,
+        "eval_cpu_preprocess_loops": args.eval_cpu_preprocess_loops,
         "total_steps": total_steps,
         "total_time_sec": total_time,
         "steps_per_sec": total_steps / total_time,
